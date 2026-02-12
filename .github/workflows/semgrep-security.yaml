@@ -1,1 +1,39 @@
-404: Not Found
+# Copy this file to your target repo at:
+#   .github/workflows/semgrep-security.yaml
+#
+# Then trigger manually from the Actions tab → "Security Scan" → "Run workflow"
+name: Security Scan (WSO2 Custom Rules)
+
+on:
+  workflow_dispatch:
+    inputs:
+      scan-paths:
+        description: "Paths to scan (space-separated, relative to repo root)"
+        required: false
+        default: "."
+        type: string
+      severity-threshold:
+        description: "Minimum severity"
+        required: false
+        default: "WARNING"
+        type: choice
+        options:
+          - INFO
+          - WARNING
+          - ERROR
+      fail-on-error:
+        description: "Fail if ERROR-severity findings exist"
+        required: false
+        default: false
+        type: boolean
+
+jobs:
+  wso2-semgrep:
+    uses: jhivandb/vulnerability-scanner/.github/workflows/semgrep-scan.yaml@master
+    permissions:
+      contents: read
+      security-events: write
+    with:
+      scan-paths: ${{ inputs.scan-paths }}
+      severity-threshold: ${{ inputs.severity-threshold }}
+      fail-on-error: ${{ inputs.fail-on-error }}
