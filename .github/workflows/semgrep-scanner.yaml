@@ -1,0 +1,143 @@
+
+# Standalone workflow for target repos.
+# Drop this single file into any WSO2 repo at .github/workflows/semgrep-security.yaml
+# and trigger it from the Actions tab.
+#
+# This workflow is self-contained — it checks out the custom rules from
+# vulnerability-scanner and runs everything inline. No reusable workflow needed.
+name: Security Scan (WSO2 Custom Rules)
+
+on:
+  workflow_dispatch:
+    inputs:
+      scan-paths:
+        description: "Paths to scan (space-separated, relative to repo root)"
+        required: false
+        default: "."
+        type: string
+      severity-threshold:
+        description: "Minimum severity"
+        required: false
+        default: "WARNING"
+        type: choice
+        options:
+          - INFO
+          - WARNING
+          - ERROR
+      fail-on-error:
+        description: "Fail if ERROR-severity findings exist"
+        required: false
+        default: false
+        type: boolean
+      rules-ref:
+        description: "Rules repo branch/tag to use"
+        required: false
+        default: "master"
+        type: string
+
+permissions:
+  contents: read
+  security-events: write
+
+jobs:
+  semgrep-scan:
+    name: Semgrep Custom Rules
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout this repo
+        uses: actions/checkout@v4
+
+      - name: Checkout custom rules
+        uses: actions/checkout@v4
+        with:
+          repository: jhivandb/vulnerability-scanner
+          ref: ${{ inputs.rules-ref }}
+          path: _semgrep-rules
+          sparse-checkout: semgrep-rules/rules
+          sparse-checkout-cone-mode: false
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Semgrep
+        run: pip install semgrep
+
+      - name: Run Semgrep scan
+        id: scan
+        run: |
+          set +e
+          semgrep scan \
+            --config _semgrep-rules/semgrep-rules/rules \
+            --sarif \
+            --output results.sarif \
+            --no-git-ignore \
+            --severity ${{ inputs.severity-threshold }} \
+            ${{ inputs.scan-paths }}
+          SCAN_EXIT=$?
+          set -e
+
+          if [ -f results.sarif ]; then
+            python3 << 'PYEOF' >> "$GITHUB_OUTPUT"
+          import json
+
+          with open("results.sarif") as f:
+              sarif = json.load(f)
+
+          results = sarif.get("runs", [{}])[0].get("results", [])
+          errors   = sum(1 for r in results if r.get("level") == "error")
+          warnings = sum(1 for r in results if r.get("level") == "warning")
+          notes    = sum(1 for r in results if r.get("level") == "note")
+          total    = len(results)
+
+          print(f"errors={errors}")
+          print(f"warnings={warnings}")
+          print(f"notes={notes}")
+          print(f"total={total}")
+          PYEOF
+          else
+            echo "errors=0"   >> "$GITHUB_OUTPUT"
+            echo "warnings=0" >> "$GITHUB_OUTPUT"
+            echo "notes=0"    >> "$GITHUB_OUTPUT"
+            echo "total=0"    >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Upload SARIF to GitHub Code Scanning
+        if: always() && hashFiles('results.sarif') != ''
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: results.sarif
+          category: wso2-semgrep-custom
+
+      - name: Upload SARIF as artifact
+        if: always() && hashFiles('results.sarif') != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: semgrep-sarif
+          path: results.sarif
+          retention-days: 30
+
+      - name: Job summary
+        if: always()
+        run: |
+          echo "## WSO2 Semgrep Security Scan" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Severity | Count |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|----------|-------|" >> "$GITHUB_STEP_SUMMARY"
+          echo "| ERROR    | ${{ steps.scan.outputs.errors }} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| WARNING  | ${{ steps.scan.outputs.warnings }} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| INFO     | ${{ steps.scan.outputs.notes }} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| **Total**| **${{ steps.scan.outputs.total }}** |" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "Full results: **Security tab → Code scanning alerts** (repo admins only)" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "SARIF file also available as a build artifact." >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Fail on ERROR findings
+        if: inputs.fail-on-error && steps.scan.outputs.errors != '0'
+        run: |
+          echo "::error::Found ${{ steps.scan.outputs.errors }} ERROR-severity security findings. See the Security tab for details."
+          exit 1
+
