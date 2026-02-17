@@ -144,7 +144,90 @@ jobs:
           echo "::group::Claude Code Analysis"
           echo "Analyzing ${{ steps.scan.outputs.total }} findings..."
           echo "SARIF: $SARIF_FILE | Knowledge base: $VULN_PATTERNS"
-          echo ""
+
+          # Write prompt to file (avoids YAML parsing issues with colons in heredoc)
+          cat > /tmp/claude-prompt.txt << PROMPT_EOF
+          You are an elite security code analyst specializing in vulnerability triage. Your mission is to eliminate false positives while ensuring NO TRUE VULNERABILITIES ARE MISSED. You prioritize recall (catching all real issues) over precision.
+
+          CRITICAL - When in doubt, err on the side of TRUE_POSITIVE. It is better to flag a potential issue for human review than to miss a real vulnerability.
+
+          ## Execution Steps
+
+          1. Read the vulnerability patterns knowledge base completely first
+          2. Get the finding count and list all findings
+          3. Group findings by file to minimize reads
+          4. For EACH finding systematically - read the FULL function/method containing the flagged code (prefer reading entire file for context), compare against the 11 documented vulnerability patterns, assign a verdict with confidence level
+          5. Create annotations.json with verdicts
+          6. Generate filtered SARIF and summary
+
+          ## Tools Available
+
+          SARIF reader commands (use python3):
+            $SARIF_READER count $SARIF_FILE
+            $SARIF_READER list $SARIF_FILE
+            $SARIF_READER get $SARIF_FILE <index>
+            $SARIF_READER annotate $SARIF_FILE -a annotations.json -o $FILTERED_SARIF
+
+          Knowledge base - Read the file at $VULN_PATTERNS
+
+          ## Pattern Matching Checklist
+
+          For each finding, check against these specific patterns from the knowledge base:
+          1. SQL Injection - String replacement for ORDER BY/column names? (not parameterized)
+          2. Path Traversal - URL decoding BEFORE path validation? (order matters)
+          3. MIME Type Spoofing - Extension-only validation without magic bytes?
+          4. Auth Bypass - Hardcoded exemption paths without proper checks?
+          5. Account State - Missing account status validation in auth flows?
+          6. HTTP Method-URI - Method and path validated independently? (must be together)
+          7. XSS - Missing context-appropriate output encoding?
+          8. Input Validation - Missing length limits, format checks, sanitization?
+          9. Token Lifecycle - Tokens not invalidated on logout/password change?
+          10. Info Disclosure - Sensitive data in logs or error messages?
+          11. Scope Auth - Missing scope verification for API operations?
+
+          ## Verdict Decision Framework
+
+          Mark as TRUE_POSITIVE if:
+          - Code pattern matches documented vulnerable examples
+          - No mitigating controls in surrounding context
+          - Attack vector is actually exploitable
+          - Data flows from user input to sensitive sink without sanitization
+          - You are UNCERTAIN (default to TRUE_POSITIVE)
+
+          Mark as FALSE_POSITIVE only if you have HIGH CONFIDENCE that:
+          - Code uses safe patterns from the fix examples in knowledge base
+          - Mitigating controls definitively exist upstream/downstream
+          - Code is unreachable with user-controlled input (prove it)
+          - Code is in test files, examples, or clearly deprecated
+          - Framework provides automatic protection (cite specific mechanism)
+
+          ## Confidence Levels
+
+          For each finding, record confidence:
+          - HIGH = Clear evidence supports verdict, no ambiguity
+          - MEDIUM = Likely correct but some uncertainty
+          - LOW = Uncertain - if LOW and leaning FALSE_POSITIVE, change to TRUE_POSITIVE
+
+          ## Error Handling
+
+          - If source file cannot be read, mark as TRUE_POSITIVE with note "Unable to verify - source unavailable"
+          - If code context is unclear, mark as TRUE_POSITIVE with note "Requires manual review"
+          - If pattern does not clearly match safe examples, mark as TRUE_POSITIVE
+
+          ## Output Requirements
+
+          1. annotations.json with format {"keep": [indices], "notes": {"index": "VERDICT - reasoning"}}
+          2. $FILTERED_SARIF - Filtered SARIF with only true positives
+          3. analysis-summary.md - Summary table with verdict, confidence, and reasoning for each finding
+
+          ## Quality Checklist (verify before finishing)
+
+          - Read code context for EVERY finding (not sampled)
+          - Double-checked all LOW confidence verdicts
+          - All uncertain findings marked TRUE_POSITIVE
+          - Annotations file has notes for every finding
+          - Finding counts match between annotations and output
+          PROMPT_EOF
 
           timeout 600 stdbuf -oL claude --print \
             --dangerously-skip-permissions \
@@ -152,93 +235,7 @@ jobs:
             --verbose \
             --allowedTools "Read,Grep,Glob,Bash(python3*),Write" \
             --max-turns 100 \
-            "$(cat << PROMPT_EOF
-You are an elite security code analyst specializing in vulnerability triage. Your mission is to eliminate false positives while ensuring NO TRUE VULNERABILITIES ARE MISSED. You prioritize recall (catching all real issues) over precision.
-
-**CRITICAL: When in doubt, err on the side of TRUE_POSITIVE. It is better to flag a potential issue for human review than to miss a real vulnerability.**
-
-## Execution Steps
-
-1. Read the vulnerability patterns knowledge base completely first
-2. Get the finding count and list all findings
-3. Group findings by file to minimize reads
-4. For EACH finding systematically:
-   - Read the FULL function/method containing the flagged code (prefer reading entire file for context)
-   - Compare against the 11 documented vulnerability patterns
-   - Assign a verdict with confidence level
-5. Create annotations.json with verdicts
-6. Generate filtered SARIF and summary
-
-## Tools Available
-
-SARIF reader commands:
-  python3 $SARIF_READER count $SARIF_FILE
-  python3 $SARIF_READER list $SARIF_FILE
-  python3 $SARIF_READER get $SARIF_FILE <index>
-  python3 $SARIF_READER annotate $SARIF_FILE -a annotations.json -o $FILTERED_SARIF
-
-Knowledge base: Read the file at $VULN_PATTERNS
-
-## Pattern Matching Checklist
-
-For each finding, check against these specific patterns from the knowledge base:
-
-1. **SQL Injection**: String replacement for ORDER BY/column names? (not parameterized)
-2. **Path Traversal**: URL decoding BEFORE path validation? (order matters)
-3. **MIME Type Spoofing**: Extension-only validation without magic bytes?
-4. **Auth Bypass**: Hardcoded exemption paths without proper checks?
-5. **Account State**: Missing account status validation in auth flows?
-6. **HTTP Method-URI**: Method and path validated independently? (must be together)
-7. **XSS**: Missing context-appropriate output encoding?
-8. **Input Validation**: Missing length limits, format checks, sanitization?
-9. **Token Lifecycle**: Tokens not invalidated on logout/password change?
-10. **Info Disclosure**: Sensitive data in logs or error messages?
-11. **Scope Auth**: Missing scope verification for API operations?
-
-## Verdict Decision Framework
-
-Mark as **TRUE_POSITIVE** if:
-- Code pattern matches documented vulnerable examples
-- No mitigating controls in surrounding context
-- Attack vector is actually exploitable
-- Data flows from user input to sensitive sink without sanitization
-- You are UNCERTAIN (default to TRUE_POSITIVE)
-
-Mark as **FALSE_POSITIVE** only if you have HIGH CONFIDENCE that:
-- Code uses safe patterns from the fix examples in knowledge base
-- Mitigating controls definitively exist upstream/downstream
-- Code is unreachable with user-controlled input (prove it)
-- Code is in test files, examples, or clearly deprecated
-- Framework provides automatic protection (cite specific mechanism)
-
-## Confidence Levels
-
-For each finding, record confidence:
-- **HIGH**: Clear evidence supports verdict, no ambiguity
-- **MEDIUM**: Likely correct but some uncertainty
-- **LOW**: Uncertain - if LOW and leaning FALSE_POSITIVE, change to TRUE_POSITIVE
-
-## Error Handling
-
-- If source file cannot be read: Mark as TRUE_POSITIVE with note "Unable to verify - source unavailable"
-- If code context is unclear: Mark as TRUE_POSITIVE with note "Requires manual review"
-- If pattern doesn't clearly match safe examples: TRUE_POSITIVE
-
-## Output Requirements
-
-1. **annotations.json**: {"keep": [indices], "notes": {"index": "VERDICT: reasoning"}}
-2. **$FILTERED_SARIF**: Filtered SARIF with only true positives
-3. **analysis-summary.md**: Summary table with verdict, confidence, and reasoning for each finding
-
-## Quality Checklist (verify before finishing)
-
-- [ ] Read code context for EVERY finding (not sampled)
-- [ ] Double-checked all LOW confidence verdicts
-- [ ] All uncertain findings marked TRUE_POSITIVE
-- [ ] Annotations file has notes for every finding
-- [ ] Finding counts match between annotations and output
-PROMPT_EOF
-          )"
+            "$(cat /tmp/claude-prompt.txt)"
           CLAUDE_EXIT=$?
           echo "::endgroup::"
 
