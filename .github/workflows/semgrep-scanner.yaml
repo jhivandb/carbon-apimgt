@@ -4,10 +4,15 @@
 #
 # SETUP (one-time, for private rules repo):
 #   1. Create a GitHub PAT (classic) with `repo` scope
-#   2. In the target repo: Settings → Secrets → Actions → New secret
+#   2. In the target repo: Settings -> Secrets -> Actions -> New secret
 #   3. Name: REPO_ACCESS_TOKEN, Value: the PAT
 #
-# If vulnerability-scanner is public, the secret is not needed.
+# For Claude Code analysis (optional):
+#   4. Create an Anthropic API key at console.anthropic.com
+#   5. Add secret: ANTHROPIC_API_KEY, Value: the API key
+#
+# If vulnerability-scanner is public, REPO_ACCESS_TOKEN is not needed.
+# If ANTHROPIC_API_KEY is not set, Claude analysis is skipped.
 name: Security Scan (WSO2 Custom Rules)
 
 on:
@@ -37,10 +42,20 @@ on:
         required: false
         default: "master"
         type: string
+      run-claude-analysis:
+        description: "Run Claude Code to filter false positives"
+        required: false
+        default: true
+        type: boolean
 
 permissions:
   contents: read
   security-events: write
+
+env:
+  SARIF_FILE: results.sarif
+  FILTERED_SARIF: filtered.sarif
+  VULN_SCANNER_PATH: _vuln-scanner
 
 jobs:
   semgrep-scan:
@@ -51,14 +66,17 @@ jobs:
       - name: Checkout this repo
         uses: actions/checkout@v4
 
-      - name: Checkout custom rules
+      - name: Checkout custom rules and analysis tools
         uses: actions/checkout@v4
         with:
           repository: jhivandb/vulnerability-scanner
           ref: ${{ inputs.rules-ref }}
-          path: _semgrep-rules
+          path: ${{ env.VULN_SCANNER_PATH }}
           token: ${{ secrets.REPO_ACCESS_TOKEN || github.token }}
-          sparse-checkout: semgrep-rules/rules
+          sparse-checkout: |
+            semgrep-rules/rules
+            .claude/skills/sarif/scripts
+            vulnerabilities.md
           sparse-checkout-cone-mode: false
 
       - name: Set up Python
@@ -74,73 +92,203 @@ jobs:
         run: |
           set +e
           semgrep scan \
-            --config _semgrep-rules/semgrep-rules/rules \
+            --config "$VULN_SCANNER_PATH/semgrep-rules/rules" \
             --sarif \
-            --output results.sarif \
+            --output "$SARIF_FILE" \
             --no-git-ignore \
-            --severity ${{ inputs.severity-threshold }} \
+            --severity "${{ inputs.severity-threshold }}" \
             ${{ inputs.scan-paths }}
-          SCAN_EXIT=$?
           set -e
 
-          if [ -f results.sarif ]; then
-            python3 << 'PYEOF' >> "$GITHUB_OUTPUT"
+          python3 << 'EOF' >> "$GITHUB_OUTPUT"
           import json
+          from pathlib import Path
 
-          with open("results.sarif") as f:
+          sarif_path = Path("results.sarif")
+          if not sarif_path.exists():
+              print("errors=0")
+              print("warnings=0")
+              print("notes=0")
+              print("total=0")
+          else:
+              sarif = json.loads(sarif_path.read_text())
+              results = sarif.get("runs", [{}])[0].get("results", [])
+              levels = {"error": 0, "warning": 0, "note": 0}
+              for r in results:
+                  level = r.get("level", "warning")
+                  if level in levels:
+                      levels[level] += 1
+              print(f"errors={levels['error']}")
+              print(f"warnings={levels['warning']}")
+              print(f"notes={levels['note']}")
+              print(f"total={len(results)}")
+          EOF
+
+      - name: Set up Node.js for Claude analysis
+        if: inputs.run-claude-analysis && steps.scan.outputs.total != '0'
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install Claude Code CLI
+        if: inputs.run-claude-analysis && steps.scan.outputs.total != '0'
+        run: npm install -g @anthropic-ai/claude-code
+
+      - name: Analyze findings with Claude Code
+        id: claude-analysis
+        if: inputs.run-claude-analysis && steps.scan.outputs.total != '0'
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          if [ -z "$ANTHROPIC_API_KEY" ]; then
+            echo "::warning::ANTHROPIC_API_KEY not set, skipping Claude analysis"
+            echo "skipped=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          SARIF_READER="$VULN_SCANNER_PATH/.claude/skills/sarif/scripts/sarif.py"
+          VULN_PATTERNS="$VULN_SCANNER_PATH/vulnerabilities.md"
+
+          # Run Claude Code in non-interactive CI mode
+          timeout 600 claude --print \
+            --dangerously-skip-permissions \
+            --model sonnet \
+            --allowedTools "Read,Grep,Glob,Bash(python3*),Write" \
+            --max-turns 50 \
+            "$(cat << EOF
+          You are a security code analyst. Analyze the SARIF scan results and filter out false positives.
+
+          ## Instructions
+
+          1. First, read the vulnerability patterns from the knowledge base
+          2. Get the list of findings from the SARIF file
+          3. For EACH finding:
+             - Read the source code at the flagged location (the full function/method)
+             - Compare against documented vulnerable patterns
+             - Determine if it's a TRUE_POSITIVE or FALSE_POSITIVE
+          4. Create an annotations JSON file with your verdicts
+          5. Generate a filtered SARIF with only true positives
+
+          ## Tools available
+
+          - SARIF reader: python3 $SARIF_READER <command> <args>
+            - count $SARIF_FILE - get total findings
+            - list $SARIF_FILE - list all findings with indices
+            - get $SARIF_FILE <index> - get details for a finding
+            - annotate $SARIF_FILE -a annotations.json -o $FILTERED_SARIF - filter and annotate
+
+          - Knowledge base: Read the file at $VULN_PATTERNS
+
+          ## Output
+
+          Generate $FILTERED_SARIF containing only true positive findings.
+          Generate analysis-summary.md with a table of your verdicts and reasoning.
+
+          ## Decision Framework
+
+          Mark as TRUE_POSITIVE if:
+          - Code pattern matches documented vulnerable examples
+          - No mitigating controls exist in surrounding context
+          - Data flows from user input to sensitive sink
+
+          Mark as FALSE_POSITIVE if:
+          - Code has been fixed using safe patterns
+          - Mitigating controls exist upstream/downstream
+          - Code is in test files or not reachable with user input
+          - Framework provides automatic protection
+          EOF
+          )" || {
+            EXIT_CODE=$?
+            if [ $EXIT_CODE -eq 124 ]; then
+              echo "::warning::Claude analysis timed out after 10 minutes"
+            fi
+            echo "skipped=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          }
+
+          if [ -f "$FILTERED_SARIF" ]; then
+            echo "skipped=false" >> "$GITHUB_OUTPUT"
+            python3 << 'EOF' >> "$GITHUB_OUTPUT"
+          import json
+          with open("filtered.sarif") as f:
               sarif = json.load(f)
-
-          results = sarif.get("runs", [{}])[0].get("results", [])
-          errors   = sum(1 for r in results if r.get("level") == "error")
-          warnings = sum(1 for r in results if r.get("level") == "warning")
-          notes    = sum(1 for r in results if r.get("level") == "note")
-          total    = len(results)
-
-          print(f"errors={errors}")
-          print(f"warnings={warnings}")
-          print(f"notes={notes}")
-          print(f"total={total}")
-          PYEOF
+          meta = sarif.get("runs", [{}])[0].get("properties", {}).get("analysisMetadata", {})
+          print(f"true_positives={meta.get('truePositiveCount', 0)}")
+          print(f"false_positives={meta.get('falsePositiveCount', 0)}")
+          EOF
           else
-            echo "errors=0"   >> "$GITHUB_OUTPUT"
-            echo "warnings=0" >> "$GITHUB_OUTPUT"
-            echo "notes=0"    >> "$GITHUB_OUTPUT"
-            echo "total=0"    >> "$GITHUB_OUTPUT"
+            echo "::warning::Claude analysis did not produce filtered.sarif"
+            echo "skipped=true" >> "$GITHUB_OUTPUT"
           fi
 
       - name: Upload SARIF to GitHub Code Scanning
         if: always() && hashFiles('results.sarif') != ''
         uses: github/codeql-action/upload-sarif@v3
         with:
-          sarif_file: results.sarif
+          sarif_file: ${{ steps.claude-analysis.outputs.skipped != 'true' && hashFiles('filtered.sarif') != '' && 'filtered.sarif' || 'results.sarif' }}
           category: wso2-semgrep-custom
 
-      - name: Upload SARIF as artifact
+      - name: Upload SARIF artifacts
         if: always() && hashFiles('results.sarif') != ''
         uses: actions/upload-artifact@v4
         with:
           name: semgrep-sarif
-          path: results.sarif
+          path: |
+            results.sarif
+            filtered.sarif
+            analysis-summary.md
           retention-days: 30
 
       - name: Job summary
         if: always()
         run: |
-          echo "## WSO2 Semgrep Security Scan" >> "$GITHUB_STEP_SUMMARY"
-          echo "" >> "$GITHUB_STEP_SUMMARY"
-          echo "| Severity | Count |" >> "$GITHUB_STEP_SUMMARY"
-          echo "|----------|-------|" >> "$GITHUB_STEP_SUMMARY"
-          echo "| ERROR    | ${{ steps.scan.outputs.errors }} |" >> "$GITHUB_STEP_SUMMARY"
-          echo "| WARNING  | ${{ steps.scan.outputs.warnings }} |" >> "$GITHUB_STEP_SUMMARY"
-          echo "| INFO     | ${{ steps.scan.outputs.notes }} |" >> "$GITHUB_STEP_SUMMARY"
-          echo "| **Total**| **${{ steps.scan.outputs.total }}** |" >> "$GITHUB_STEP_SUMMARY"
-          echo "" >> "$GITHUB_STEP_SUMMARY"
-          echo "Full results: **Security tab → Code scanning alerts** (repo admins only)" >> "$GITHUB_STEP_SUMMARY"
-          echo "" >> "$GITHUB_STEP_SUMMARY"
-          echo "SARIF file also available as a build artifact." >> "$GITHUB_STEP_SUMMARY"
+          cat >> "$GITHUB_STEP_SUMMARY" << EOF
+          ## WSO2 Semgrep Security Scan
+
+          ### Raw Scan Results
+          | Severity | Count |
+          |----------|-------|
+          | ERROR    | ${{ steps.scan.outputs.errors }} |
+          | WARNING  | ${{ steps.scan.outputs.warnings }} |
+          | INFO     | ${{ steps.scan.outputs.notes }} |
+          | **Total**| **${{ steps.scan.outputs.total }}** |
+
+          EOF
+
+          if [ "${{ steps.claude-analysis.outputs.skipped }}" != "true" ]; then
+            cat >> "$GITHUB_STEP_SUMMARY" << EOF
+          ### Claude Code Analysis
+          | Category | Count |
+          |----------|-------|
+          | True Positives | ${{ steps.claude-analysis.outputs.true_positives }} |
+          | False Positives | ${{ steps.claude-analysis.outputs.false_positives }} |
+
+          Claude analyzed each finding against documented vulnerability patterns.
+
+          EOF
+            if [ -f analysis-summary.md ]; then
+              echo "#### Analysis Details" >> "$GITHUB_STEP_SUMMARY"
+              cat analysis-summary.md >> "$GITHUB_STEP_SUMMARY"
+              echo "" >> "$GITHUB_STEP_SUMMARY"
+            fi
+          fi
+
+          cat >> "$GITHUB_STEP_SUMMARY" << 'EOF'
+          Full results: **Security tab -> Code scanning alerts** (repo admins only)
+
+          SARIF files available as build artifacts.
+          EOF
 
       - name: Fail on ERROR findings
         if: inputs.fail-on-error && steps.scan.outputs.errors != '0'
         run: |
-          echo "::error::Found ${{ steps.scan.outputs.errors }} ERROR-severity security findings. See the Security tab for details."
-          exit 1
+          if [ "${{ steps.claude-analysis.outputs.skipped }}" != "true" ]; then
+            TRUE_POSITIVES="${{ steps.claude-analysis.outputs.true_positives }}"
+            if [ "$TRUE_POSITIVES" != "0" ] && [ -n "$TRUE_POSITIVES" ]; then
+              echo "::error::Found $TRUE_POSITIVES verified security findings (after false positive filtering). See the Security tab for details."
+              exit 1
+            fi
+          else
+            echo "::error::Found ${{ steps.scan.outputs.errors }} ERROR-severity security findings. See the Security tab for details."
+            exit 1
+          fi
