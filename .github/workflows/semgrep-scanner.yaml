@@ -1,10 +1,13 @@
-
 # Standalone workflow for target repos.
 # Drop this single file into any WSO2 repo at .github/workflows/semgrep-security.yaml
 # and trigger it from the Actions tab.
 #
-# This workflow is self-contained — it checks out the custom rules from
-# vulnerability-scanner and runs everything inline. No reusable workflow needed.
+# SETUP (one-time, for private rules repo):
+#   1. Create a GitHub PAT (classic) with `repo` scope
+#   2. In the target repo: Settings → Secrets → Actions → New secret
+#   3. Name: REPO_ACCESS_TOKEN, Value: the PAT
+#
+# If vulnerability-scanner is public, the secret is not needed.
 name: Security Scan (WSO2 Custom Rules)
 
 on:
@@ -54,6 +57,7 @@ jobs:
           repository: jhivandb/vulnerability-scanner
           ref: ${{ inputs.rules-ref }}
           path: _semgrep-rules
+          token: ${{ secrets.REPO_ACCESS_TOKEN || github.token }}
           sparse-checkout: semgrep-rules/rules
           sparse-checkout-cone-mode: false
 
@@ -140,4 +144,3 @@ jobs:
         run: |
           echo "::error::Found ${{ steps.scan.outputs.errors }} ERROR-severity security findings. See the Security tab for details."
           exit 1
-
