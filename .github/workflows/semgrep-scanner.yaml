@@ -1,18 +1,10 @@
-# Standalone workflow for target repos.
-# Drop this single file into any WSO2 repo at .github/workflows/semgrep-security.yaml
-# and trigger it from the Actions tab.
+# Drop this file into any WSO2 repo at .github/workflows/semgrep-security.yaml
 #
-# SETUP (one-time, for private rules repo):
-#   1. Create a GitHub PAT (classic) with `repo` scope
-#   2. In the target repo: Settings -> Secrets -> Actions -> New secret
-#   3. Name: REPO_ACCESS_TOKEN, Value: the PAT
+# Required secrets (if vulnerability-scanner is private):
+#   REPO_ACCESS_TOKEN - GitHub PAT with `repo` scope
 #
-# For Claude Code analysis (optional):
-#   4. Create an Anthropic API key at console.anthropic.com
-#   5. Add secret: ANTHROPIC_API_KEY, Value: the API key
-#
-# If vulnerability-scanner is public, REPO_ACCESS_TOKEN is not needed.
-# If ANTHROPIC_API_KEY is not set, Claude analysis is skipped.
+# Optional secrets (for Claude Code false-positive filtering):
+#   ANTHROPIC_API_KEY - Anthropic API key from console.anthropic.com
 name: Security Scan (WSO2 Custom Rules)
 
 on:
@@ -124,7 +116,7 @@ jobs:
               print(f"total={len(results)}")
           EOF
 
-      - name: Set up Node.js for Claude analysis
+      - name: Set up Node.js
         if: inputs.run-claude-analysis && steps.scan.outputs.total != '0'
         uses: actions/setup-node@v4
         with:
@@ -149,77 +141,139 @@ jobs:
           SARIF_READER="$VULN_SCANNER_PATH/.claude/skills/sarif/scripts/sarif.py"
           VULN_PATTERNS="$VULN_SCANNER_PATH/vulnerabilities.md"
 
-          # Run Claude Code in non-interactive CI mode
-          timeout 600 claude --print \
+          echo "::group::Claude Code Analysis"
+          echo "Analyzing ${{ steps.scan.outputs.total }} findings..."
+          echo "SARIF: $SARIF_FILE | Knowledge base: $VULN_PATTERNS"
+          echo ""
+
+          timeout 600 stdbuf -oL claude --print \
             --dangerously-skip-permissions \
             --model sonnet \
+            --verbose \
             --allowedTools "Read,Grep,Glob,Bash(python3*),Write" \
-            --max-turns 50 \
-            "$(cat << EOF
-          You are a security code analyst. Analyze the SARIF scan results and filter out false positives.
+            --max-turns 100 \
+            "$(cat << PROMPT_EOF
+You are an elite security code analyst specializing in vulnerability triage. Your mission is to eliminate false positives while ensuring NO TRUE VULNERABILITIES ARE MISSED. You prioritize recall (catching all real issues) over precision.
 
-          ## Instructions
+**CRITICAL: When in doubt, err on the side of TRUE_POSITIVE. It is better to flag a potential issue for human review than to miss a real vulnerability.**
 
-          1. First, read the vulnerability patterns from the knowledge base
-          2. Get the list of findings from the SARIF file
-          3. For EACH finding:
-             - Read the source code at the flagged location (the full function/method)
-             - Compare against documented vulnerable patterns
-             - Determine if it's a TRUE_POSITIVE or FALSE_POSITIVE
-          4. Create an annotations JSON file with your verdicts
-          5. Generate a filtered SARIF with only true positives
+## Execution Steps
 
-          ## Tools available
+1. Read the vulnerability patterns knowledge base completely first
+2. Get the finding count and list all findings
+3. Group findings by file to minimize reads
+4. For EACH finding systematically:
+   - Read the FULL function/method containing the flagged code (prefer reading entire file for context)
+   - Compare against the 11 documented vulnerability patterns
+   - Assign a verdict with confidence level
+5. Create annotations.json with verdicts
+6. Generate filtered SARIF and summary
 
-          - SARIF reader: python3 $SARIF_READER <command> <args>
-            - count $SARIF_FILE - get total findings
-            - list $SARIF_FILE - list all findings with indices
-            - get $SARIF_FILE <index> - get details for a finding
-            - annotate $SARIF_FILE -a annotations.json -o $FILTERED_SARIF - filter and annotate
+## Tools Available
 
-          - Knowledge base: Read the file at $VULN_PATTERNS
+SARIF reader commands:
+  python3 $SARIF_READER count $SARIF_FILE
+  python3 $SARIF_READER list $SARIF_FILE
+  python3 $SARIF_READER get $SARIF_FILE <index>
+  python3 $SARIF_READER annotate $SARIF_FILE -a annotations.json -o $FILTERED_SARIF
 
-          ## Output
+Knowledge base: Read the file at $VULN_PATTERNS
 
-          Generate $FILTERED_SARIF containing only true positive findings.
-          Generate analysis-summary.md with a table of your verdicts and reasoning.
+## Pattern Matching Checklist
 
-          ## Decision Framework
+For each finding, check against these specific patterns from the knowledge base:
 
-          Mark as TRUE_POSITIVE if:
-          - Code pattern matches documented vulnerable examples
-          - No mitigating controls exist in surrounding context
-          - Data flows from user input to sensitive sink
+1. **SQL Injection**: String replacement for ORDER BY/column names? (not parameterized)
+2. **Path Traversal**: URL decoding BEFORE path validation? (order matters)
+3. **MIME Type Spoofing**: Extension-only validation without magic bytes?
+4. **Auth Bypass**: Hardcoded exemption paths without proper checks?
+5. **Account State**: Missing account status validation in auth flows?
+6. **HTTP Method-URI**: Method and path validated independently? (must be together)
+7. **XSS**: Missing context-appropriate output encoding?
+8. **Input Validation**: Missing length limits, format checks, sanitization?
+9. **Token Lifecycle**: Tokens not invalidated on logout/password change?
+10. **Info Disclosure**: Sensitive data in logs or error messages?
+11. **Scope Auth**: Missing scope verification for API operations?
 
-          Mark as FALSE_POSITIVE if:
-          - Code has been fixed using safe patterns
-          - Mitigating controls exist upstream/downstream
-          - Code is in test files or not reachable with user input
-          - Framework provides automatic protection
-          EOF
-          )" || {
-            EXIT_CODE=$?
-            if [ $EXIT_CODE -eq 124 ]; then
+## Verdict Decision Framework
+
+Mark as **TRUE_POSITIVE** if:
+- Code pattern matches documented vulnerable examples
+- No mitigating controls in surrounding context
+- Attack vector is actually exploitable
+- Data flows from user input to sensitive sink without sanitization
+- You are UNCERTAIN (default to TRUE_POSITIVE)
+
+Mark as **FALSE_POSITIVE** only if you have HIGH CONFIDENCE that:
+- Code uses safe patterns from the fix examples in knowledge base
+- Mitigating controls definitively exist upstream/downstream
+- Code is unreachable with user-controlled input (prove it)
+- Code is in test files, examples, or clearly deprecated
+- Framework provides automatic protection (cite specific mechanism)
+
+## Confidence Levels
+
+For each finding, record confidence:
+- **HIGH**: Clear evidence supports verdict, no ambiguity
+- **MEDIUM**: Likely correct but some uncertainty
+- **LOW**: Uncertain - if LOW and leaning FALSE_POSITIVE, change to TRUE_POSITIVE
+
+## Error Handling
+
+- If source file cannot be read: Mark as TRUE_POSITIVE with note "Unable to verify - source unavailable"
+- If code context is unclear: Mark as TRUE_POSITIVE with note "Requires manual review"
+- If pattern doesn't clearly match safe examples: TRUE_POSITIVE
+
+## Output Requirements
+
+1. **annotations.json**: {"keep": [indices], "notes": {"index": "VERDICT: reasoning"}}
+2. **$FILTERED_SARIF**: Filtered SARIF with only true positives
+3. **analysis-summary.md**: Summary table with verdict, confidence, and reasoning for each finding
+
+## Quality Checklist (verify before finishing)
+
+- [ ] Read code context for EVERY finding (not sampled)
+- [ ] Double-checked all LOW confidence verdicts
+- [ ] All uncertain findings marked TRUE_POSITIVE
+- [ ] Annotations file has notes for every finding
+- [ ] Finding counts match between annotations and output
+PROMPT_EOF
+          )"
+          CLAUDE_EXIT=$?
+          echo "::endgroup::"
+
+          if [ $CLAUDE_EXIT -ne 0 ]; then
+            if [ $CLAUDE_EXIT -eq 124 ]; then
               echo "::warning::Claude analysis timed out after 10 minutes"
+            else
+              echo "::warning::Claude analysis failed with exit code $CLAUDE_EXIT"
             fi
             echo "skipped=true" >> "$GITHUB_OUTPUT"
             exit 0
-          }
+          fi
 
-          if [ -f "$FILTERED_SARIF" ]; then
-            echo "skipped=false" >> "$GITHUB_OUTPUT"
-            python3 << 'EOF' >> "$GITHUB_OUTPUT"
+          if [ ! -f "$FILTERED_SARIF" ]; then
+            echo "::warning::Claude analysis did not produce filtered.sarif"
+            echo "skipped=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "skipped=false" >> "$GITHUB_OUTPUT"
+          python3 << 'EOF'
           import json
+          import os
+
           with open("filtered.sarif") as f:
               sarif = json.load(f)
           meta = sarif.get("runs", [{}])[0].get("properties", {}).get("analysisMetadata", {})
-          print(f"true_positives={meta.get('truePositiveCount', 0)}")
-          print(f"false_positives={meta.get('falsePositiveCount', 0)}")
+          tp, fp = meta.get("truePositiveCount", 0), meta.get("falsePositiveCount", 0)
+
+          with open(os.environ["GITHUB_OUTPUT"], "a") as out:
+              out.write(f"true_positives={tp}\n")
+              out.write(f"false_positives={fp}\n")
+
+          print(f"Analysis complete: {tp} true positives, {fp} false positives")
           EOF
-          else
-            echo "::warning::Claude analysis did not produce filtered.sarif"
-            echo "skipped=true" >> "$GITHUB_OUTPUT"
-          fi
 
       - name: Upload SARIF to GitHub Code Scanning
         if: always() && hashFiles('results.sarif') != ''
@@ -242,53 +296,49 @@ jobs:
       - name: Job summary
         if: always()
         run: |
-          cat >> "$GITHUB_STEP_SUMMARY" << EOF
-          ## WSO2 Semgrep Security Scan
+          {
+            echo "## WSO2 Semgrep Security Scan"
+            echo ""
+            echo "### Raw Scan Results"
+            echo "| Severity | Count |"
+            echo "|----------|-------|"
+            echo "| ERROR    | ${{ steps.scan.outputs.errors }} |"
+            echo "| WARNING  | ${{ steps.scan.outputs.warnings }} |"
+            echo "| INFO     | ${{ steps.scan.outputs.notes }} |"
+            echo "| **Total**| **${{ steps.scan.outputs.total }}** |"
+            echo ""
 
-          ### Raw Scan Results
-          | Severity | Count |
-          |----------|-------|
-          | ERROR    | ${{ steps.scan.outputs.errors }} |
-          | WARNING  | ${{ steps.scan.outputs.warnings }} |
-          | INFO     | ${{ steps.scan.outputs.notes }} |
-          | **Total**| **${{ steps.scan.outputs.total }}** |
-
-          EOF
-
-          if [ "${{ steps.claude-analysis.outputs.skipped }}" != "true" ]; then
-            cat >> "$GITHUB_STEP_SUMMARY" << EOF
-          ### Claude Code Analysis
-          | Category | Count |
-          |----------|-------|
-          | True Positives | ${{ steps.claude-analysis.outputs.true_positives }} |
-          | False Positives | ${{ steps.claude-analysis.outputs.false_positives }} |
-
-          Claude analyzed each finding against documented vulnerability patterns.
-
-          EOF
-            if [ -f analysis-summary.md ]; then
-              echo "#### Analysis Details" >> "$GITHUB_STEP_SUMMARY"
-              cat analysis-summary.md >> "$GITHUB_STEP_SUMMARY"
-              echo "" >> "$GITHUB_STEP_SUMMARY"
+            if [ "${{ steps.claude-analysis.outputs.skipped }}" != "true" ]; then
+              echo "### Claude Code Analysis"
+              echo "| Category | Count |"
+              echo "|----------|-------|"
+              echo "| True Positives | ${{ steps.claude-analysis.outputs.true_positives }} |"
+              echo "| False Positives | ${{ steps.claude-analysis.outputs.false_positives }} |"
+              echo ""
+              echo "Claude analyzed each finding against documented vulnerability patterns."
+              echo ""
+              if [ -f analysis-summary.md ]; then
+                echo "#### Analysis Details"
+                cat analysis-summary.md
+                echo ""
+              fi
             fi
-          fi
 
-          cat >> "$GITHUB_STEP_SUMMARY" << 'EOF'
-          Full results: **Security tab -> Code scanning alerts** (repo admins only)
-
-          SARIF files available as build artifacts.
-          EOF
+            echo "Full results: **Security tab -> Code scanning alerts** (repo admins only)"
+            echo ""
+            echo "SARIF files available as build artifacts."
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Fail on ERROR findings
         if: inputs.fail-on-error && steps.scan.outputs.errors != '0'
         run: |
-          if [ "${{ steps.claude-analysis.outputs.skipped }}" != "true" ]; then
-            TRUE_POSITIVES="${{ steps.claude-analysis.outputs.true_positives }}"
-            if [ "$TRUE_POSITIVES" != "0" ] && [ -n "$TRUE_POSITIVES" ]; then
-              echo "::error::Found $TRUE_POSITIVES verified security findings (after false positive filtering). See the Security tab for details."
-              exit 1
-            fi
-          else
-            echo "::error::Found ${{ steps.scan.outputs.errors }} ERROR-severity security findings. See the Security tab for details."
+          CLAUDE_SKIPPED="${{ steps.claude-analysis.outputs.skipped }}"
+          TRUE_POSITIVES="${{ steps.claude-analysis.outputs.true_positives }}"
+
+          if [ "$CLAUDE_SKIPPED" != "true" ] && [ -n "$TRUE_POSITIVES" ] && [ "$TRUE_POSITIVES" != "0" ]; then
+            echo "::error::Found $TRUE_POSITIVES verified security findings. See the Security tab for details."
+            exit 1
+          elif [ "$CLAUDE_SKIPPED" = "true" ]; then
+            echo "::error::Found ${{ steps.scan.outputs.errors }} ERROR-severity findings. See the Security tab for details."
             exit 1
           fi
